@@ -1,0 +1,6 @@
+fastapi
+gradio
+openai
+pydantic
+requests
+uvicorn
