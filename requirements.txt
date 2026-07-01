@@ -1,6 +1,8 @@
 fastapi
+uvicorn
 gradio
-openai
+openai>=1.30
 pydantic
 requests
-uvicorn
+mcp>=1.0
+python-dotenv

@@ -1,103 +1,151 @@
+"""
+tools/ — 工具层（Tool 层）：三来源统一注册
+
+三种工具来源，统一归一化成 OpenAI 标准 tool schema，一起喂给模型：
+  ① 本地内置工具   —— weather / media（保留 v1）
+  ② 同门自研工具   —— 写个 py 函数 + @register_tool 装饰器，丢进 tools/ 自动注册
+  ③ MCP 工具       —— 通过 tools/mcp_client 连接 MCP server，自动拉取其暴露的工具
+
+关键升级（对比 v1）：
+- v1 的 register_tool 生成的是自定义 schema（喂进 prompt 让模型手写 JSON）。
+- v2 复用其 inspect 反射逻辑，但生成 **OpenAI function calling 标准 schema**，
+  配合 core/loop 的原生 tool_calls。这也是接入 MCP 生态的前提。
+- 统一 async 调用接口 registry.call()：本地同步函数用线程池包装，MCP 工具直接 await。
+"""
+
+from __future__ import annotations
+
+import asyncio
 import inspect
-import traceback
-import concurrent.futures
-import json
-from typing import Dict, Any, List, Callable, get_origin, Annotated
-from types import GenericAlias
+from typing import Annotated, Any, Callable, Optional, get_origin
 
-# 全局变量存储工具
-_TOOL_HOOKS: Dict[str, Callable] = {}
-_TOOL_DESCRIPTIONS: List[Dict] = []
-
-
-def register_tool(func: Callable):
-    """装饰器：注册工具 (保持不变)"""
-    tool_name = func.__name__
-    tool_description = inspect.getdoc(func) or "No description provided."
-    tool_description = tool_description.strip()
-
-    python_params = inspect.signature(func).parameters
-    tool_params = []
-
-    for name, param in python_params.items():
-        annotation = param.annotation
-        typ_str = "str"
-        description = ""
-        required = True
-
-        if annotation is not inspect.Parameter.empty:
-            if get_origin(annotation) == Annotated:
-                typ, metadata = annotation.__origin__, annotation.__metadata__
-                description = metadata[0] if len(metadata) > 0 else ""
-                required = metadata[1] if len(metadata) > 1 else True
-            else:
-                typ = annotation
-            typ_str = str(typ) if isinstance(typ, GenericAlias) else typ.__name__
-
-        tool_params.append({
-            "name": name,
-            "description": description,
-            "type": typ_str,
-            "required": required,
-        })
-
-    tool_def = {
-        "name": tool_name,
-        "description": tool_description,
-        "params": tool_params,
-    }
-
-    _TOOL_HOOKS[tool_name] = func
-    _TOOL_DESCRIPTIONS.append(tool_def)
-    print(f"[System] 已注册工具: {tool_name}")
-    return func
+# ---- Python 类型 → JSON Schema 类型映射 ----
+_PY_TO_JSON = {
+    "str": "string",
+    "int": "integer",
+    "float": "number",
+    "bool": "boolean",
+    "list": "array",
+    "dict": "object",
+}
 
 
-def get_tools_schema() -> List[Dict]:
-    return _TOOL_DESCRIPTIONS
+class ToolRegistry:
+    """工具注册表：本地函数工具 + MCP 工具统一管理。"""
+
+    def __init__(self):
+        # name -> {"schema": openai_schema, "func": callable|None, "kind": "local"|"mcp", "mcp_call": callable|None}
+        self._tools: dict[str, dict] = {}
+
+    # ---------- ① / ② 本地 & 自研工具 ----------
+    def register(self, func: Callable) -> Callable:
+        """装饰器：注册本地/自研工具，从函数签名反射生成 OpenAI 标准 schema。"""
+        name = func.__name__
+        description = (inspect.getdoc(func) or "No description provided.").strip()
+
+        properties: dict[str, Any] = {}
+        required: list[str] = []
+
+        for pname, param in inspect.signature(func).parameters.items():
+            ann = param.annotation
+            jtype, pdesc, is_required = "string", "", True
+            if ann is not inspect.Parameter.empty:
+                if get_origin(ann) is Annotated:
+                    base = ann.__origin__
+                    meta = ann.__metadata__
+                    pdesc = meta[0] if len(meta) > 0 else ""
+                    is_required = meta[1] if len(meta) > 1 else True
+                    jtype = _PY_TO_JSON.get(getattr(base, "__name__", "str"), "string")
+                else:
+                    jtype = _PY_TO_JSON.get(getattr(ann, "__name__", "str"), "string")
+            # 有默认值的参数视为可选
+            if param.default is not inspect.Parameter.empty:
+                is_required = False
+            properties[pname] = {"type": jtype, "description": pdesc}
+            if is_required:
+                required.append(pname)
+
+        schema = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            },
+        }
+        self._tools[name] = {"schema": schema, "func": func, "kind": "local", "mcp_call": None}
+        print(f"[tools] 注册本地工具: {name}")
+        return func
+
+    # ---------- ③ MCP 工具 ----------
+    def register_mcp_tool(self, name: str, description: str, parameters: dict, mcp_call: Callable) -> None:
+        """
+        注册一个来自 MCP server 的工具。
+        - parameters: MCP server 返回的 JSON Schema（inputSchema）
+        - mcp_call: async 可调用，签名 async (arguments: dict) -> str
+        """
+        schema = {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description or f"MCP tool {name}",
+                "parameters": parameters or {"type": "object", "properties": {}},
+            },
+        }
+        self._tools[name] = {"schema": schema, "func": None, "kind": "mcp", "mcp_call": mcp_call}
+        print(f"[tools] 注册 MCP 工具: {name}")
+
+    # ---------- 查询 ----------
+    def openai_schema(self) -> list[dict]:
+        """返回喂给模型的全部工具 schema（OpenAI function calling 格式）。"""
+        return [t["schema"] for t in self._tools.values()]
+
+    def list_tools(self) -> list[dict]:
+        """返回工具清单（供 Web 技能管理面板展示）。"""
+        return [
+            {"name": n, "kind": t["kind"], "description": t["schema"]["function"]["description"]}
+            for n, t in self._tools.items()
+        ]
+
+    def has(self, name: str) -> bool:
+        return name in self._tools
+
+    # ---------- 统一异步调用 ----------
+    async def call(self, name: str, arguments: dict) -> Any:
+        """
+        统一调用入口。
+        - 本地工具：可能是同步函数，用线程池执行避免阻塞事件循环。
+        - MCP 工具：直接 await 其 async mcp_call。
+        """
+        if name not in self._tools:
+            raise KeyError(f"工具 {name} 未注册")
+        entry = self._tools[name]
+
+        if entry["kind"] == "mcp":
+            return await entry["mcp_call"](arguments)
+
+        func = entry["func"]
+        if inspect.iscoroutinefunction(func):
+            return await func(**arguments)
+        # 同步函数丢到线程池
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: func(**arguments))
 
 
-def run_tools_with_params(parsed_params: Dict[str, Any]) -> str:
-    """
-    【核心修改】根据解析好的参数，并发执行工具
-    parsed_params 格式示例:
-    {
-        "get_weather": {"city_name": "武汉"},
-        "search_remote_media": {"query": "办公室"}
-    }
-    """
-    results = []
-    print(f"\n⚡ [Parallel-Run] 接收到 {len(parsed_params)} 个工具的任务，开始执行...")
-
-    def run_single_tool(name, func, kwargs):
-        try:
-            # 执行工具
-            ret = func(**kwargs)
-            return f"【工具 {name} 执行成功】\n参数: {kwargs}\n结果: {ret}\n"
-        except Exception as e:
-            return f"【工具 {name} 执行失败】\n参数: {kwargs}\n原因: {str(e)}\n"
-
-    # 使用线程池并发执行
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        futures = []
-        for tool_name, args in parsed_params.items():
-            if tool_name in _TOOL_HOOKS and args:  # 只有当 args 不为空/None 时才执行
-                futures.append(executor.submit(run_single_tool, tool_name, _TOOL_HOOKS[tool_name], args))
-
-        if not futures:
-            return "没有工具被触发执行。"
-
-        for future in concurrent.futures.as_completed(futures):
-            results.append(future.result())
-
-    return "\n".join(results)
+# 全局默认注册表（本地工具通过装饰器注册到这里）
+registry = ToolRegistry()
 
 
-# 保留旧接口兼容
-def dispatch_tool(tool_name: str, tool_params: Dict[str, Any]) -> str:
-    if tool_name not in _TOOL_HOOKS:
-        return f"错误: 工具 {tool_name} 不存在"
-    try:
-        return str(_TOOL_HOOKS[tool_name](**tool_params))
-    except Exception as e:
-        return f"工具执行出错: {str(e)}"
+def register_tool(func: Callable) -> Callable:
+    """向后兼容的装饰器名（同门自研工具沿用这个名字即可）。"""
+    return registry.register(func)
+
+
+def load_builtin_tools() -> None:
+    """导入内置工具模块，触发装饰器注册。"""
+    from . import weather  # noqa: F401
+    from . import media    # noqa: F401

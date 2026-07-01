@@ -6,3 +6,8 @@ __pycache__/
 .env
 .idea/
 .DS_Store
+
+# v2 运行时产物
+logs/
+config/memory.sqlite3
+config/*.sqlite3
