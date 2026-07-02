@@ -63,9 +63,24 @@ class ChatRequest(BaseModel):
 
 
 class LearnMCPRequest(BaseModel):
+    """
+    学习一个 MCP server。字段对齐官方 mcpServers 配置，支持三种传输：
+    - streamablehttp / sse : type + url + headers（如瑞幸远程 MCP）
+    - stdio                : type + command + args + env（本地进程）
+    可直接把厂商给的 mcpServers 里某个 server 的配置体贴进来。
+    """
     name: str
-    command: str
+    type: str = "stdio"
+    url: str | None = None
+    headers: dict = {}
+    command: str | None = None
     args: list[str] = []
+    env: dict = {}
+
+    def to_spec(self) -> dict:
+        if self.type in ("streamablehttp", "streamable_http", "http", "sse"):
+            return {"type": self.type, "url": self.url, "headers": self.headers}
+        return {"type": "stdio", "command": self.command, "args": self.args, "env": self.env}
 
 
 @app.post("/api/chat")
@@ -88,11 +103,14 @@ async def api_tools():
 @app.post("/api/mcp/learn")
 async def api_learn_mcp(req: LearnMCPRequest):
     """
-    让系统"学会"一个 MCP server（例如瑞幸点餐）。
-    body: {"name":"luckin","command":"npx","args":["luckin-coffee-mcp"]}
+    让系统"学会"一个 MCP server。示例：
+    - 远程(瑞幸这种)：{"name":"my-coffee","type":"streamablehttp",
+                      "url":"https://gwmcp.lkcoffee.com/order/user/mcp",
+                      "headers":{"Authorization":"Bearer <token>"}}
+    - 本地进程：      {"name":"luckin","type":"stdio","command":"npx","args":["some-mcp"]}
     """
     try:
-        learned = await mcp_manager.learn_stdio_server(req.name, req.command, req.args)
+        learned = await mcp_manager.learn(req.name, req.to_spec())
         return {"status": "success", "server": req.name, "learned_tools": learned}
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "message": str(e)}

@@ -69,17 +69,39 @@ python main.py              # 命令行
 
 ## 让它「学会」一个 MCP 技能
 
-系统可以吃 MCP：同门自研工具能加，网上现成的 MCP（如瑞幸点餐）给它连接方式就学会。
+系统可以吃 MCP，配置格式对齐 MCP 官方 `mcpServers`，支持三种传输：
+
+| type | 场景 | 关键字段 |
+|---|---|---|
+| `streamablehttp` | 远程云端 MCP（当前公有服务最主流，如瑞幸点餐） | `url` + `headers` |
+| `sse` | 远程 SSE MCP | `url` + `headers` |
+| `stdio` | 本地起子进程 | `command` + `args` + `env` |
+
+**远程（Streamable HTTP，对应瑞幸给的接入方式）：**
 
 ```bash
-# 例：学会一个 stdio 型 MCP server
 curl -X POST http://127.0.0.1:8500/api/mcp/learn \
   -H "Content-Type: application/json" \
-  -d '{"name":"luckin","command":"npx","args":["luckin-coffee-mcp"]}'
+  -d '{
+        "name": "my-coffee",
+        "type": "streamablehttp",
+        "url": "https://gwmcp.lkcoffee.com/order/user/mcp",
+        "headers": {"Authorization": "Bearer <登录后复制的Token>"}
+      }'
+```
+
+**本地进程（stdio）：**
+
+```bash
+curl -X POST http://127.0.0.1:8500/api/mcp/learn \
+  -H "Content-Type: application/json" \
+  -d '{"name":"some-tool","type":"stdio","command":"npx","args":["some-mcp"]}'
 ```
 
 系统会连上该 server、拉取它暴露的全部工具、注册进工具表，并写入 `config/mcp_servers.json`，
 下次启动自动加载。之后模型即可通过 tool_calls 调用这些新技能。查看已装工具：`GET /api/tools`。
+
+> 配置结构与官方一致：厂商给你的 `mcpServers.<名字>` 配置体，加个 `name` 字段平铺进来即可。
 
 ## 新增本地工具（同门自研）
 
