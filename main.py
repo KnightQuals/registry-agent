@@ -8,6 +8,7 @@ main.py — 命令行入口（v2）
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
 
 from dotenv import load_dotenv
@@ -51,7 +52,7 @@ async def main() -> None:
     session_id = "cli-" + uuid.uuid4().hex[:8]
 
     print("=" * 46)
-    print("🤖 Registry Agent v2（ReAct + Harness）已启动")
+    print("Registry Agent v2.1（ReAct + Harness + Stream）已启动")
     print(f"   {agent.model.describe()}")
     print(f"   已加载工具: {[t['name'] for t in registry.list_tools()]}")
     print("   输入 exit / quit / 退出 结束")
@@ -67,8 +68,24 @@ async def main() -> None:
                 continue
             if user_input.lower() in ("exit", "quit", "退出"):
                 break
-            answer = await agent.run(session_id, user_input)
-            print(f"\n🤖 AI: {answer}")
+            print("\nAI: ", end="", flush=True)
+            emitted_token = False
+            async for event in agent.run_stream(session_id, user_input):
+                event_type, data = event["event"], event["data"]
+                if event_type == "status":
+                    print(f"\n[状态] {data.get('message', '')}", file=sys.stderr)
+                elif event_type == "tool_call":
+                    print(f"\n[工具] 调用 {data.get('name', '')}", file=sys.stderr)
+                elif event_type == "tool_result":
+                    print(f"\n[工具] 完成 {data.get('name', '')}", file=sys.stderr)
+                elif event_type == "token":
+                    emitted_token = True
+                    print(data.get("text", ""), end="", flush=True)
+                elif event_type == "final" and not emitted_token:
+                    print(data.get("answer", ""), end="", flush=True)
+                elif event_type == "error":
+                    print(f"\n[错误] {data.get('message', '')}", file=sys.stderr)
+            print()
     finally:
         await mcp.close()
 

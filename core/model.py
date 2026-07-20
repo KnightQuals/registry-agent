@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 try:
     from openai import AsyncOpenAI
@@ -100,3 +100,36 @@ class ModelClient:
             kwargs["tool_choice"] = tool_choice
 
         return await self._client.chat.completions.create(**kwargs)
+
+    async def stream_chat(
+        self,
+        messages: list[dict],
+        tools: Optional[list[dict]] = None,
+        tool_choice: str = "auto",
+        temperature: Optional[float] = None,
+    ) -> AsyncIterator[Any]:
+        """
+        SSE/流式入口使用的模型调用。
+
+        逐个 yield OpenAI ChatCompletionChunk：
+        - 最终回答时，chunk.delta.content 是一小段文本 token；
+        - 工具回合时，chunk.delta.tool_calls 分段携带工具名与参数。
+        ReAct 内核负责把后者重新拼成完整工具调用。
+        """
+        if self._client is None:
+            raise RuntimeError("openai SDK 未安装，请先 pip install openai")
+
+        kwargs: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": messages,
+            "temperature": self.config.temperature if temperature is None else temperature,
+            "max_tokens": self.config.max_tokens,
+            "stream": True,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice
+
+        stream = await self._client.chat.completions.create(**kwargs)
+        async for chunk in stream:
+            yield chunk

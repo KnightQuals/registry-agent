@@ -80,4 +80,6 @@ def register_as_tool(registry, kb: KnowledgeBase) -> None:
             "required": ["query"],
         },
         mcp_call=_search,
+        source="knowledge",
+        original_name="search_knowledge_base",
     )

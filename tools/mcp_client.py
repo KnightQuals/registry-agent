@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from typing import Any, Optional
 
 try:
@@ -39,6 +40,12 @@ except ImportError:
 DEFAULT_CONFIG = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "config", "mcp_servers.json"
 )
+
+
+def _safe_identifier(value: str) -> str:
+    """把 MCP server/tool 名转换为 OpenAI function name 可接受的稳定标识。"""
+    cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", value or "tool").strip("_").lower()
+    return cleaned or "tool"
 
 
 class _ServerConnection:
@@ -152,24 +159,33 @@ class MCPManager:
         if not _HAS_MCP:
             raise RuntimeError("未安装 mcp SDK，请先 pip install mcp")
 
+        # 同名 server 重新接入前，先关闭旧连接并卸掉旧工具，避免后台 task 泄漏和工具重复。
+        if name in self._conns:
+            await self.remove(name, persist=False)
+
         conn = _ServerConnection(name, spec)
         tools = await conn.start()  # 连接失败会在此抛出
         self._conns[name] = conn
 
         learned = []
+        source = f"mcp:{name}"
         for tool in tools:
-            tool_name = tool.name
+            remote_name = tool.name
+            # 不同 MCP server 很可能都叫 search/list/get；给模型的名字必须全局唯一。
+            exposed_name = f"mcp__{_safe_identifier(name)}__{_safe_identifier(remote_name)}"
 
-            async def _mcp_call(arguments: dict, _conn=conn, _tname=tool_name) -> str:
+            async def _mcp_call(arguments: dict, _conn=conn, _tname=remote_name) -> str:
                 return await _conn.call(_tname, arguments)
 
             self.registry.register_mcp_tool(
-                name=tool_name,
-                description=tool.description or "",
+                name=exposed_name,
+                description=(tool.description or "") + f" [来自 MCP server: {name}]",
                 parameters=tool.inputSchema or {"type": "object", "properties": {}},
                 mcp_call=_mcp_call,
+                source=source,
+                original_name=remote_name,
             )
-            learned.append(tool_name)
+            learned.append(exposed_name)
 
         if persist:
             cfg = self._load_config()
@@ -190,6 +206,44 @@ class MCPManager:
         return await self.learn(
             name, {"type": "streamablehttp", "url": url, "headers": headers or {}}, persist
         )
+
+    @staticmethod
+    def _redacted_spec(spec: dict) -> dict:
+        """给 API/UI 展示的安全配置副本：绝不把 headers/env 里的 token 原样返回。"""
+        safe = {key: value for key, value in spec.items() if key not in ("headers", "env")}
+        if spec.get("headers"):
+            safe["has_headers"] = True
+        if spec.get("env"):
+            safe["has_env"] = True
+        return safe
+
+    def list_servers(self) -> list[dict]:
+        """列出已持久化的 MCP server；配置中的密钥会被脱敏。"""
+        cfg = self._load_config()
+        out = []
+        for name, spec in cfg.get("mcpServers", {}).items():
+            source = f"mcp:{name}"
+            tool_names = [tool["name"] for tool in self.registry.list_tools() if tool.get("source") == source]
+            out.append({
+                "name": name,
+                "connected": name in self._conns,
+                "tools": tool_names,
+                "tool_count": len(tool_names),
+                "config": self._redacted_spec(spec),
+            })
+        return out
+
+    async def remove(self, name: str, persist: bool = True) -> list[str]:
+        """关闭一个 MCP server，卸载其工具；persist=True 时同时从配置移除。"""
+        conn = self._conns.pop(name, None)
+        if conn is not None:
+            await conn.close()
+        removed_tools = self.registry.unregister_source(f"mcp:{name}")
+        if persist:
+            cfg = self._load_config()
+            cfg.get("mcpServers", {}).pop(name, None)
+            self._save_config(cfg)
+        return removed_tools
 
     async def load_all_from_config(self) -> dict[str, list[str]]:
         """启动时把配置里所有 MCP server 重新连上并注册工具。"""

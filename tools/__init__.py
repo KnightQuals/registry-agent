@@ -34,7 +34,8 @@ class ToolRegistry:
     """工具注册表：本地函数工具 + MCP 工具统一管理。"""
 
     def __init__(self):
-        # name -> {"schema": openai_schema, "func": callable|None, "kind": "local"|"mcp", "mcp_call": callable|None}
+        # name -> {schema, func, kind, mcp_call, source, original_name}
+        # source 用于展示/卸载某个 MCP server 时精确清理其工具。
         self._tools: dict[str, dict] = {}
 
     # ---------- ① / ② 本地 & 自研工具 ----------
@@ -77,16 +78,33 @@ class ToolRegistry:
                 },
             },
         }
-        self._tools[name] = {"schema": schema, "func": func, "kind": "local", "mcp_call": None}
+        self._tools[name] = {
+            "schema": schema,
+            "func": func,
+            "kind": "local",
+            "mcp_call": None,
+            "source": "local",
+            "original_name": name,
+        }
         print(f"[tools] 注册本地工具: {name}")
         return func
 
     # ---------- ③ MCP 工具 ----------
-    def register_mcp_tool(self, name: str, description: str, parameters: dict, mcp_call: Callable) -> None:
+    def register_mcp_tool(
+        self,
+        name: str,
+        description: str,
+        parameters: dict,
+        mcp_call: Callable,
+        source: str = "mcp",
+        original_name: str | None = None,
+    ) -> None:
         """
         注册一个来自 MCP server 的工具。
+        - name: 暴露给模型的唯一工具名（多个 MCP 同名工具会做命名空间隔离）
         - parameters: MCP server 返回的 JSON Schema（inputSchema）
         - mcp_call: async 可调用，签名 async (arguments: dict) -> str
+        - source: MCP server 名称，用于技能管理面板展示和卸载。
         """
         schema = {
             "type": "function",
@@ -96,20 +114,59 @@ class ToolRegistry:
                 "parameters": parameters or {"type": "object", "properties": {}},
             },
         }
-        self._tools[name] = {"schema": schema, "func": None, "kind": "mcp", "mcp_call": mcp_call}
+        self._tools[name] = {
+            "schema": schema,
+            "func": None,
+            "kind": "mcp",
+            "mcp_call": mcp_call,
+            "source": source,
+            "original_name": original_name or name,
+        }
         print(f"[tools] 注册 MCP 工具: {name}")
 
     # ---------- 查询 ----------
-    def openai_schema(self) -> list[dict]:
-        """返回喂给模型的全部工具 schema（OpenAI function calling 格式）。"""
-        return [t["schema"] for t in self._tools.values()]
+    def openai_schema(self, names: Optional[list[str]] = None) -> list[dict]:
+        """
+        返回喂给模型的工具 schema（OpenAI function calling 格式）。
+        names=None 返回全部；传候选名列表时只返回路由后的子集。
+        """
+        if names is None:
+            return [t["schema"] for t in self._tools.values()]
+        return [self._tools[name]["schema"] for name in names if name in self._tools]
 
     def list_tools(self) -> list[dict]:
-        """返回工具清单（供 Web 技能管理面板展示）。"""
+        """返回工具清单（供 API、路由器和 Web 技能管理面板展示）。"""
         return [
-            {"name": n, "kind": t["kind"], "description": t["schema"]["function"]["description"]}
+            {
+                "name": n,
+                "kind": t["kind"],
+                "source": t["source"],
+                "original_name": t["original_name"],
+                "description": t["schema"]["function"]["description"],
+            }
             for n, t in self._tools.items()
         ]
+
+    def tool_search_text(self, name: str) -> str:
+        """返回路由器用于粗筛的名称、说明和参数说明文本。"""
+        entry = self._tools[name]
+        func = entry["schema"]["function"]
+        props = func.get("parameters", {}).get("properties", {})
+        prop_text = " ".join(
+            f"{param_name} {meta.get('description', '')}" for param_name, meta in props.items()
+        )
+        return f"{name} {entry['original_name']} {entry['source']} {func.get('description', '')} {prop_text}"
+
+    def unregister(self, name: str) -> bool:
+        """卸载一个已注册工具。仅由技能管理/MCP 卸载流程使用。"""
+        return self._tools.pop(name, None) is not None
+
+    def unregister_source(self, source: str) -> list[str]:
+        """卸载某个 MCP server 贡献的全部工具，返回被移除的工具名。"""
+        names = [name for name, entry in self._tools.items() if entry.get("source") == source]
+        for name in names:
+            self._tools.pop(name, None)
+        return names
 
     def has(self, name: str) -> bool:
         return name in self._tools
